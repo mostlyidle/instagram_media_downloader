@@ -22,9 +22,9 @@ From the project folder:
 python3 -m venv .venv
 source .venv/bin/activate
 
-# 2) Install Python dependencies
+# 2) Install the project and its Python dependencies
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+pip install -e .
 
 # 3) Install Playwright's Chromium browser
 python -m playwright install chromium
@@ -38,7 +38,7 @@ brew install ffmpeg
 This opens a local browser window. You log in manually. The program saves cookies under `.auth/`, which is ignored by git.
 
 ```bash
-python -m ig_media_downloader login
+ig-scraper login
 ```
 
 Keep `.auth/instagram_cookies.txt` private. It can contain session cookies.
@@ -46,13 +46,20 @@ Keep `.auth/instagram_cookies.txt` private. It can contain session cookies.
 ## Download a profile
 
 ```bash
-python -m ig_media_downloader download "https://www.instagram.com/USERNAME/"
+ig-scraper --user USERNAME
+```
+
+`@USERNAME` works too. The username shortcut accepts the same download options
+as the full command. Full profile URLs remain supported:
+
+```bash
+ig-scraper download "https://www.instagram.com/USERNAME/"
 ```
 
 For testing, cap it to a small number of posts first:
 
 ```bash
-python -m ig_media_downloader download "https://www.instagram.com/USERNAME/" --max-posts 10 --show-browser --write-metadata
+ig-scraper --user USERNAME --max-posts 10 --show-browser --write-metadata
 ```
 
 The downloaded media will be placed under:
@@ -111,8 +118,8 @@ exits instead of sharing the Instagram session and generating additional traffic
 Run:
 
 ```bash
-python -m ig_media_downloader login
-python -m ig_media_downloader download "https://www.instagram.com/USERNAME/" --show-browser
+ig-scraper login
+ig-scraper --user USERNAME --show-browser
 ```
 
 Then watch the browser window. If Instagram shows a login wall, challenge, captcha, rate-limit page, or private account page, the downloader will not bypass it.
@@ -142,7 +149,7 @@ Rerun the same command. The tool uses `downloads/downloaded_archive.txt` so yt-d
 To avoid rescrolling the profile, reuse the manifest from the previous run:
 
 ```bash
-python -m ig_media_downloader download "https://www.instagram.com/USERNAME/" \
+ig-scraper --user USERNAME \
   --manifest downloads/manifests/USERNAME_YYYYMMDD_HHMMSS.json
 ```
 

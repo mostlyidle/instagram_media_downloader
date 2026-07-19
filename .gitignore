@@ -5,5 +5,6 @@ __pycache__/
 downloads/
 .ig_media_downloader.lock
 *.zip
+*.egg-info/
 .DS_Store
 tests/

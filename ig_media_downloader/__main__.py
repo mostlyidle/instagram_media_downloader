@@ -25,6 +25,7 @@ INSTAGRAM_HOSTS = {"instagram.com", "www.instagram.com"}
 # or under the profile that owns it (``/username/reel/SHORTCODE/``).
 # ``/reels/`` is also used by some current Instagram pages.
 POST_PATH_RE = re.compile(r"^/(?:[^/?#]+/)?(p|reels?|tv)/([^/?#]+)/?", re.IGNORECASE)
+INSTAGRAM_USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 PROFILE_EXCLUDED_PREFIXES = {
     "p",
     "reel",
@@ -195,6 +196,25 @@ def normalize_instagram_url(raw_url: str) -> str:
 
     clean_path = parsed.path.rstrip("/") + "/"
     return urlunparse(("https", "www.instagram.com", clean_path, "", "", ""))
+
+
+def profile_url_from_username(raw_username: str) -> str:
+    """Build a canonical Instagram profile URL from a username."""
+    username = raw_username.strip().removeprefix("@")
+    if not INSTAGRAM_USERNAME_RE.fullmatch(username):
+        raise ValueError("--user must be a valid Instagram username")
+    return f"https://www.instagram.com/{username}/"
+
+
+def expand_user_shortcut(argv: list[str]) -> list[str]:
+    """Translate ``--user USERNAME`` into the existing download command."""
+    if "--user" not in argv:
+        return argv
+    if not argv or argv[0] != "--user":
+        raise ValueError("Use --user before any download options")
+    if len(argv) < 2:
+        raise ValueError("--user requires an Instagram username")
+    return ["download", profile_url_from_username(argv[1]), *argv[2:]]
 
 
 def is_profile_url(url: str) -> bool:
@@ -668,8 +688,9 @@ def command_download(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="ig-media-downloader",
+        prog="ig-scraper",
         description="Download media from Instagram profiles that are publicly accessible or accessible to your own logged-in session.",
+        epilog="Shortcut: ig-scraper --user USERNAME [download options]",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -724,8 +745,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
-    args = parser.parse_args(argv)
     try:
+        raw_argv = list(sys.argv[1:] if argv is None else argv)
+        args = parser.parse_args(expand_user_shortcut(raw_argv))
         args.func(args)
     except KeyboardInterrupt:
         raise SystemExit("Interrupted.")
