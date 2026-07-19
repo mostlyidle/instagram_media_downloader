@@ -86,6 +86,7 @@ ACCESS_ERROR_MARKERS = (
     "http error 400",
     "http error 401",
     "http error 403",
+    "http error 404",
     "http error 429",
     "rate limit",
     "rate-limit",
@@ -123,11 +124,11 @@ class AccessCircuitBreaker:
         if access_errors:
             self.consecutive_failures += 1
             eprint(
-                f"Access/rate-limit error {self.consecutive_failures}/{self.max_failures} for {url}."
+                f"Access/content/rate-limit error {self.consecutive_failures}/{self.max_failures} for {url}."
             )
             if self.consecutive_failures >= self.max_failures:
                 raise RuntimeError(
-                    "Stopped after repeated access or rate-limit errors. Wait before retrying, "
+                    "Stopped after repeated access, missing-content, or rate-limit errors. Wait before retrying, "
                     "then run `login` if Instagram asks you to sign in again."
                 )
         elif succeeded:
@@ -724,7 +725,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-access-failures",
         type=int,
         default=3,
-        help="Stop after this many consecutive access or rate-limit errors. Default: 3",
+        help="Stop after this many consecutive access, missing-content, or rate-limit errors. Default: 3",
     )
     dl.add_argument(
         "--images-only",

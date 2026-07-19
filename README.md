@@ -98,7 +98,7 @@ exits instead of sharing the Instagram session and generating additional traffic
 # Reuse an existing URL manifest without rescrolling the profile
 --manifest downloads/manifests/USERNAME_YYYYMMDD_HHMMSS.json
 
-# Stop after repeated access or rate-limit errors (default: 3)
+# Stop after repeated access, missing-content, or rate-limit errors (default: 3)
 --max-access-failures 3
 
 # Download only still-image posts and image carousel slides
@@ -155,4 +155,4 @@ ig-scraper --user USERNAME \
 
 ### It stopped after access or rate-limit errors
 
-The downloader stops after three consecutive HTTP 400/401/403/429, login, challenge, or captcha-style errors to avoid making more requests. Wait before retrying; if Instagram asks you to sign in, run `login` again. You can resume with the saved manifest instead of collecting the profile again.
+The downloader stops after three consecutive HTTP 400/401/403/404/429, login, challenge, or captcha-style errors to avoid making more requests. A 404 can mean that a post was deleted or is no longer accessible. Wait before retrying; if Instagram asks you to sign in, run `login` again. You can resume with the saved manifest instead of collecting the profile again.
