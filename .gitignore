@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .auth/
 downloads/
+.ig_media_downloader.lock
 *.zip
 .DS_Store
 tests/

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
 import json
+import os
 import re
 import shutil
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 from urllib.parse import urlparse, urlunparse
 
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -35,6 +39,62 @@ PROFILE_EXCLUDED_PREFIXES = {
     "legal",
 }
 
+# Keep collection state in the page so each scroll only transfers newly rendered
+# media links to Python instead of reparsing every visible profile anchor.
+COLLECT_NEW_MEDIA_HREFS_JS = r"""
+els => {
+    const seen = window.__igMediaDownloaderSeen || new Set();
+    window.__igMediaDownloaderSeen = seen;
+    const hrefs = [];
+
+    for (const link of els) {
+        const match = /^\/(?:[^/?#]+\/)?(p|reels?|tv)\/([^/?#]+)\/?/i.exec(
+            link.pathname
+        );
+        if (!match) continue;
+
+        let kind = match[1].toLowerCase();
+        if (kind === "reels") kind = "reel";
+        const key = `${kind}/${match[2]}`;
+        if (seen.has(key)) continue;
+
+        seen.add(key);
+        hrefs.push(link.href);
+    }
+    return hrefs;
+}
+"""
+
+HAS_NEW_MEDIA_HREF_JS = r"""
+() => {
+    const seen = window.__igMediaDownloaderSeen || new Set();
+    return Array.from(document.querySelectorAll("a[href]")).some(link => {
+        const match = /^\/(?:[^/?#]+\/)?(p|reels?|tv)\/([^/?#]+)\/?/i.exec(
+            link.pathname
+        );
+        if (!match) return false;
+
+        let kind = match[1].toLowerCase();
+        if (kind === "reels") kind = "reel";
+        return !seen.has(`${kind}/${match[2]}`);
+    });
+}
+"""
+
+ACCESS_ERROR_MARKERS = (
+    "http error 400",
+    "http error 401",
+    "http error 403",
+    "http error 429",
+    "rate limit",
+    "rate-limit",
+    "login required",
+    "login is required",
+    "challenge",
+    "captcha",
+    "empty media response",
+)
+
 
 @dataclass(frozen=True)
 class DownloadPlan:
@@ -46,6 +106,79 @@ class DownloadPlan:
 
 def eprint(*values: object) -> None:
     print(*values, file=sys.stderr)
+
+
+class AccessCircuitBreaker:
+    """Stop a run before repeated access failures generate more traffic."""
+
+    def __init__(self, max_failures: int) -> None:
+        if max_failures < 1:
+            raise ValueError("max_access_failures must be at least 1")
+        self.max_failures = max_failures
+        self.consecutive_failures = 0
+
+    def record(self, url: str, errors: Iterable[str], succeeded: bool) -> None:
+        access_errors = [error for error in errors if self._is_access_error(error)]
+        if access_errors:
+            self.consecutive_failures += 1
+            eprint(
+                f"Access/rate-limit error {self.consecutive_failures}/{self.max_failures} for {url}."
+            )
+            if self.consecutive_failures >= self.max_failures:
+                raise RuntimeError(
+                    "Stopped after repeated access or rate-limit errors. Wait before retrying, "
+                    "then run `login` if Instagram asks you to sign in again."
+                )
+        elif succeeded:
+            self.consecutive_failures = 0
+
+    @staticmethod
+    def _is_access_error(error: str) -> bool:
+        message = error.lower()
+        return any(marker in message for marker in ACCESS_ERROR_MARKERS)
+
+
+class DownloadLogger:
+    """Keep yt-dlp output visible while retaining errors for the circuit breaker."""
+
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+
+    def debug(self, message: str) -> None:
+        if not message.startswith("[debug]"):
+            print(message)
+
+    def info(self, message: str) -> None:
+        print(message)
+
+    def warning(self, message: str) -> None:
+        eprint(f"WARNING: {message}")
+
+    def error(self, message: str) -> None:
+        self.errors.append(message)
+        eprint(f"ERROR: {message}")
+
+
+@contextmanager
+def workspace_run_lock(lock_path: Path) -> Iterator[None]:
+    """Prevent concurrent runs in one workspace from sharing an Instagram session."""
+    lock_file = lock_path.open("a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise
+            raise RuntimeError("Another downloader run is already active in this workspace") from exc
+
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(f"pid={os.getpid()}\n")
+        lock_file.flush()
+        yield
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
 
 
 def normalize_instagram_url(raw_url: str) -> str:
@@ -68,6 +201,33 @@ def is_profile_url(url: str) -> bool:
     parsed = urlparse(url)
     parts = [p for p in parsed.path.split("/") if p]
     return len(parts) == 1 and parts[0].lower() not in PROFILE_EXCLUDED_PREFIXES
+
+
+def load_manifest_urls(manifest_path: Path, expected_profile_url: str) -> list[str]:
+    """Load and validate URLs collected by an earlier run for this profile."""
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"Manifest was not found: {manifest_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Manifest is not valid JSON: {manifest_path}") from exc
+
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Manifest must contain an object: {manifest_path}")
+    profile_url = manifest.get("profile_url")
+    if not isinstance(profile_url, str):
+        raise ValueError(f"Manifest has no profile_url: {manifest_path}")
+    if normalize_instagram_url(profile_url) != expected_profile_url:
+        raise ValueError("Manifest profile_url does not match the requested profile URL")
+
+    manifest_urls = manifest.get("urls")
+    if not isinstance(manifest_urls, list) or not all(isinstance(url, str) for url in manifest_urls):
+        raise ValueError(f"Manifest has no valid URL list: {manifest_path}")
+
+    urls = extract_post_urls_from_hrefs(manifest_urls)
+    if len(urls) != len(manifest_urls):
+        raise ValueError(f"Manifest contains an unsupported media URL: {manifest_path}")
+    return urls
 
 
 def extract_post_urls_from_hrefs(hrefs: Iterable[str]) -> list[str]:
@@ -119,6 +279,21 @@ def wait_for_profile_media_links(page, timeout_ms: int = 20_000) -> bool:
         return True
     except PlaywrightTimeoutError:
         return False
+
+
+def collect_new_profile_media_hrefs(page) -> list[str]:
+    """Return only media links that have not been seen on an earlier scroll."""
+    return page.eval_on_selector_all("a[href]", COLLECT_NEW_MEDIA_HREFS_JS)
+
+
+def wait_for_new_profile_media_link(page, timeout_ms: float) -> None:
+    """Wait for lazy-loaded media, returning early as soon as a new link appears."""
+    if timeout_ms <= 0:
+        return
+    try:
+        page.wait_for_function(HAS_NEW_MEDIA_HREF_JS, timeout=timeout_ms)
+    except PlaywrightTimeoutError:
+        pass
 
 
 def export_cookies_to_netscape(cookies: list[dict], cookie_file: Path) -> None:
@@ -213,7 +388,7 @@ def collect_profile_post_urls(
             )
 
         for scroll_num in range(max_scrolls + 1):
-            hrefs = page.eval_on_selector_all("a[href]", "els => els.map(a => a.href)")
+            hrefs = collect_new_profile_media_hrefs(page)
             for url in extract_post_urls_from_hrefs(hrefs):
                 found.setdefault(url, None)
                 if max_posts and len(found) >= max_posts:
@@ -234,8 +409,11 @@ def collect_profile_post_urls(
                 print("No new URLs found after several scrolls; stopping collection.")
                 break
 
+            if scroll_num >= max_scrolls:
+                break
+
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(scroll_pause)
+            wait_for_new_profile_media_link(page, max(0.0, scroll_pause) * 1000)
 
         if storage_state:
             storage_state.parent.mkdir(parents=True, exist_ok=True)
@@ -276,7 +454,7 @@ def build_ydl_options(
         opts["cookiefile"] = str(cookie_file)
     if write_metadata:
         opts["writeinfojson"] = True
-    if write_thumbnail and not images_only:
+    if write_thumbnail:
         opts["writethumbnail"] = True
     if images_only:
         # Instagram exposes stills as thumbnails rather than video formats.
@@ -327,47 +505,66 @@ def build_image_download_info(info: dict) -> dict | None:
     return image_info
 
 
-def download_images(
+def download_extracted_media(
     urls: list[str],
     output_dir: Path,
     archive_path: Path,
     cookie_file: Path | None,
     write_metadata: bool,
+    write_thumbnail: bool,
+    images_only: bool,
+    max_access_failures: int = 3,
 ) -> None:
+    logger = DownloadLogger()
+    circuit_breaker = AccessCircuitBreaker(max_access_failures)
     opts = build_ydl_options(
         output_dir=output_dir,
         archive_path=archive_path,
         cookie_file=cookie_file,
         write_metadata=write_metadata,
-        write_thumbnail=False,
+        write_thumbnail=write_thumbnail,
+        # Raw extraction keeps image entries available for manual processing.
         images_only=True,
     )
+    opts["logger"] = logger
     image_count = 0
+    video_count = 0
 
     with YoutubeDL(opts) as ydl:
         for url in urls:
+            error_count = len(logger.errors)
+            info = None
             try:
-                info = ydl.extract_info(url, download=False)
+                info = ydl.extract_info(url, download=False, process=False)
             except DownloadError as exc:
                 eprint(f"Could not inspect {url}: {exc}")
-                continue
-            if not info:
-                # yt-dlp returns no metadata when this URL is already in the
-                # download archive. There is nothing new to inspect here.
-                continue
+                logger.errors.append(str(exc))
+            else:
+                if info:
+                    for entry in iter_media_entries(info):
+                        for key in ("extractor", "extractor_key", "webpage_url", "original_url"):
+                            if info.get(key) and not entry.get(key):
+                                entry[key] = info[key]
 
-            for entry in iter_media_entries(info):
-                # Video entries have downloadable formats. Image entries have
-                # only image candidates in their thumbnails collection.
-                if entry.get("formats"):
-                    continue
-                image_info = build_image_download_info(entry)
-                if not image_info:
-                    continue
-                ydl.process_info(image_info)
-                image_count += 1
+                        if entry.get("formats"):
+                            if not images_only:
+                                if ydl.process_ie_result(entry, download=True):
+                                    video_count += 1
+                            continue
+                        image_info = build_image_download_info(entry)
+                        if not image_info:
+                            continue
+                        ydl.process_info(image_info)
+                        if image_info.get("__write_download_archive") is True:
+                            ydl.record_download_archive(image_info)
+                            image_count += 1
 
-    print(f"Processed {image_count} image(s).")
+            circuit_breaker.record(url, logger.errors[error_count:], succeeded=info is not None)
+
+    if images_only:
+        print(f"Processed {image_count} image(s).")
+    else:
+        print(f"Processed {video_count} video(s) and {image_count} image(s).")
 
 
 def download_urls(
@@ -378,34 +575,25 @@ def download_urls(
     write_metadata: bool,
     write_thumbnail: bool,
     images_only: bool,
+    max_access_failures: int = 3,
 ) -> None:
     if not urls:
         print("No URLs to download.")
         return
 
-    if images_only:
-        download_images(
-            urls=urls,
-            output_dir=output_dir,
-            archive_path=archive_path,
-            cookie_file=cookie_file,
-            write_metadata=write_metadata,
-        )
-        return
-
-    if not shutil.which("ffmpeg"):
+    if not images_only and not shutil.which("ffmpeg"):
         eprint("Warning: ffmpeg was not found on PATH. Videos may not merge/remux correctly.")
 
-    opts = build_ydl_options(
+    download_extracted_media(
+        urls=urls,
         output_dir=output_dir,
         archive_path=archive_path,
         cookie_file=cookie_file,
         write_metadata=write_metadata,
         write_thumbnail=write_thumbnail,
-        images_only=False,
+        images_only=images_only,
+        max_access_failures=max_access_failures,
     )
-    with YoutubeDL(opts) as ydl:
-        ydl.download(urls)
 
 
 def make_plan(args: argparse.Namespace) -> DownloadPlan:
@@ -419,52 +607,63 @@ def make_plan(args: argparse.Namespace) -> DownloadPlan:
 
 
 def command_download(args: argparse.Namespace) -> None:
+    if args.max_access_failures < 1:
+        raise ValueError("--max-access-failures must be at least 1")
+
     plan = make_plan(args)
     storage_state = Path(args.storage_state).expanduser().resolve() if args.storage_state else None
     cookie_file = Path(args.cookies).expanduser().resolve() if args.cookies else None
     archive_path = plan.output_dir / "downloaded_archive.txt"
 
-    if args.direct_only:
-        urls = [plan.profile_url]
-    else:
-        urls = collect_profile_post_urls(
-            profile_url=plan.profile_url,
-            storage_state=storage_state,
-            cookie_file=cookie_file,
-            headless=not args.show_browser,
-            max_scrolls=args.max_scrolls,
-            scroll_pause=args.scroll_pause,
-            max_posts=args.max_posts,
-            channel=args.browser_channel,
-        )
-        if args.also_try_profile_url:
+    with workspace_run_lock(Path(".ig_media_downloader.lock").resolve()):
+        if args.manifest:
+            source_manifest = Path(args.manifest).expanduser().resolve()
+            urls = load_manifest_urls(source_manifest, plan.profile_url)
+            print(f"Reusing {len(urls)} post/reel URLs from manifest: {source_manifest}")
+        elif args.direct_only:
+            urls = [plan.profile_url]
+        else:
+            urls = collect_profile_post_urls(
+                profile_url=plan.profile_url,
+                storage_state=storage_state,
+                cookie_file=cookie_file,
+                headless=not args.show_browser,
+                max_scrolls=args.max_scrolls,
+                scroll_pause=args.scroll_pause,
+                max_posts=args.max_posts,
+                channel=args.browser_channel,
+            )
+
+        if args.also_try_profile_url and not args.direct_only:
             urls.append(plan.profile_url)
-        # De-duplicate after optional profile URL append.
-        urls = list(dict.fromkeys(urls))
+            # De-duplicate after optional profile URL append.
+            urls = list(dict.fromkeys(urls))
 
-    manifest = {
-        "profile_url": plan.profile_url,
-        "collected_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "count": len(urls),
-        "urls": urls,
-    }
-    plan.manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    print(f"Wrote manifest: {plan.manifest_path}")
+        if not args.manifest:
+            manifest = {
+                "profile_url": plan.profile_url,
+                "collected_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "count": len(urls),
+                "urls": urls,
+            }
+            plan.manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            print(f"Wrote manifest: {plan.manifest_path}")
 
-    if not urls:
-        print("No post/reel URLs were collected. Try running `login`, then rerun with --show-browser.")
-        return
+        if not urls:
+            print("No post/reel URLs were collected. Try running `login`, then rerun with --show-browser.")
+            return
 
-    download_urls(
-        urls=urls,
-        output_dir=plan.output_dir,
-        archive_path=archive_path,
-        cookie_file=cookie_file,
-        write_metadata=args.write_metadata,
-        write_thumbnail=args.write_thumbnail,
-        images_only=args.images_only,
-    )
-    print(f"Done. Downloads are under: {plan.output_dir}")
+        download_urls(
+            urls=urls,
+            output_dir=plan.output_dir,
+            archive_path=archive_path,
+            cookie_file=cookie_file,
+            write_metadata=args.write_metadata,
+            write_thumbnail=args.write_thumbnail,
+            images_only=args.images_only,
+            max_access_failures=args.max_access_failures,
+        )
+        print(f"Done. Downloads are under: {plan.output_dir}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -501,12 +700,23 @@ def build_parser() -> argparse.ArgumentParser:
     dl.add_argument("--write-metadata", action="store_true", help="Save yt-dlp .info.json files.")
     dl.add_argument("--write-thumbnail", action="store_true", help="Save thumbnails when yt-dlp exposes them.")
     dl.add_argument(
+        "--max-access-failures",
+        type=int,
+        default=3,
+        help="Stop after this many consecutive access or rate-limit errors. Default: 3",
+    )
+    dl.add_argument(
         "--images-only",
         action="store_true",
         help="Download still-image posts and image carousel slides, skipping videos and Reels.",
     )
     dl.add_argument("--also-try-profile-url", action="store_true", help="Also pass the profile URL directly to yt-dlp after collected URLs.")
-    dl.add_argument("--direct-only", action="store_true", help="Skip Playwright collection and pass the profile URL directly to yt-dlp.")
+    source = dl.add_mutually_exclusive_group()
+    source.add_argument("--direct-only", action="store_true", help="Skip Playwright collection and pass the profile URL directly to yt-dlp.")
+    source.add_argument(
+        "--manifest",
+        help="Reuse URLs from an earlier manifest instead of collecting the profile again.",
+    )
     dl.set_defaults(func=command_download)
 
     return parser

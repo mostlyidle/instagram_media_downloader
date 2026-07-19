@@ -67,6 +67,9 @@ A manifest of collected URLs is written under:
 downloads/manifests/
 ```
 
+Only one downloader run may execute from this project at a time. A second run
+exits instead of sharing the Instagram session and generating additional traffic.
+
 ## Useful options
 
 ```bash
@@ -84,6 +87,12 @@ downloads/manifests/
 
 # Save thumbnails when available
 --write-thumbnail
+
+# Reuse an existing URL manifest without rescrolling the profile
+--manifest downloads/manifests/USERNAME_YYYYMMDD_HHMMSS.json
+
+# Stop after repeated access or rate-limit errors (default: 3)
+--max-access-failures 3
 
 # Download only still-image posts and image carousel slides
 --images-only
@@ -129,3 +138,14 @@ ffmpeg -version
 ### I want to resume a failed run
 
 Rerun the same command. The tool uses `downloads/downloaded_archive.txt` so yt-dlp can skip media it already downloaded.
+
+To avoid rescrolling the profile, reuse the manifest from the previous run:
+
+```bash
+python -m ig_media_downloader download "https://www.instagram.com/USERNAME/" \
+  --manifest downloads/manifests/USERNAME_YYYYMMDD_HHMMSS.json
+```
+
+### It stopped after access or rate-limit errors
+
+The downloader stops after three consecutive HTTP 400/401/403/429, login, challenge, or captcha-style errors to avoid making more requests. Wait before retrying; if Instagram asks you to sign in, run `login` again. You can resume with the saved manifest instead of collecting the profile again.
