@@ -24,7 +24,7 @@ INSTAGRAM_HOSTS = {"instagram.com", "www.instagram.com"}
 # Instagram can expose a media link either directly (``/reel/SHORTCODE/``)
 # or under the profile that owns it (``/username/reel/SHORTCODE/``).
 # ``/reels/`` is also used by some current Instagram pages.
-POST_PATH_RE = re.compile(r"^/(?:[^/?#]+/)?(p|reels?|tv)/([^/?#]+)/?", re.IGNORECASE)
+POST_PATH_RE = re.compile(r"^/(?:[^/?#]+/)?(p|reels?(?!/audio/)|tv)/([^/?#]+)/?", re.IGNORECASE)
 INSTAGRAM_USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 PROFILE_EXCLUDED_PREFIXES = {
     "p",
@@ -49,14 +49,14 @@ els => {
     const hrefs = [];
 
     for (const link of els) {
-        const match = /^\/(?:[^/?#]+\/)?(p|reels?|tv)\/([^/?#]+)\/?/i.exec(
+        const match = /^\/(?:[^/?#]+\/)?(p|reels?(?!\/audio\/)|tv)\/([^/?#]+)\/?/i.exec(
             link.pathname
         );
         if (!match) continue;
 
         let kind = match[1].toLowerCase();
         if (kind === "reels") kind = "reel";
-        const key = `${kind}/${match[2]}`;
+        const key = match[2];
         if (seen.has(key)) continue;
 
         seen.add(key);
@@ -70,14 +70,14 @@ HAS_NEW_MEDIA_HREF_JS = r"""
 () => {
     const seen = window.__igMediaDownloaderSeen || new Set();
     return Array.from(document.querySelectorAll("a[href]")).some(link => {
-        const match = /^\/(?:[^/?#]+\/)?(p|reels?|tv)\/([^/?#]+)\/?/i.exec(
+        const match = /^\/(?:[^/?#]+\/)?(p|reels?(?!\/audio\/)|tv)\/([^/?#]+)\/?/i.exec(
             link.pathname
         );
         if (!match) return false;
 
         let kind = match[1].toLowerCase();
         if (kind === "reels") kind = "reel";
-        return !seen.has(`${kind}/${match[2]}`);
+        return !seen.has(match[2]);
     });
 }
 """
@@ -251,25 +251,181 @@ def load_manifest_urls(manifest_path: Path, expected_profile_url: str) -> list[s
     return urls
 
 
+def safe_creator_folder_name(value: object) -> str | None:
+    """Return a username safe to use as one output-directory component."""
+    if not isinstance(value, str) or value in {".", ".."}:
+        return None
+    if not INSTAGRAM_USERNAME_RE.fullmatch(value):
+        return None
+    return value
+
+
+def profile_username(profile_url: str) -> str | None:
+    try:
+        normalized = normalize_instagram_url(profile_url)
+    except ValueError:
+        return None
+    parts = [part for part in urlparse(normalized).path.split("/") if part]
+    if len(parts) != 1 or parts[0].lower() in PROFILE_EXCLUDED_PREFIXES:
+        return None
+    return safe_creator_folder_name(parts[0])
+
+
+def _manifest_creator_candidates(manifest_dir: Path, media_ids: set[str]) -> set[str]:
+    candidates: set[str] = set()
+    if not manifest_dir.is_dir():
+        return candidates
+
+    for manifest_path in manifest_dir.glob("*.json"):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(manifest, dict):
+            continue
+        username = profile_username(manifest.get("profile_url", ""))
+        manifest_urls = manifest.get("urls")
+        if not username or not isinstance(manifest_urls, list):
+            continue
+        urls = extract_post_urls_from_hrefs(url for url in manifest_urls if isinstance(url, str))
+        if any(urlparse(url).path.rstrip("/").split("/")[-1] in media_ids for url in urls):
+            candidates.add(username)
+    return candidates
+
+
+def _metadata_creator_candidates(folder: Path, folder_id: str) -> set[str]:
+    candidates: set[str] = set()
+    for metadata_path in folder.glob("*.info.json"):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(metadata, dict):
+            continue
+        uploader_id = str(metadata.get("uploader_id", ""))
+        username = safe_creator_folder_name(metadata.get("channel"))
+        if uploader_id == folder_id and username:
+            candidates.add(username)
+    return candidates
+
+
+def find_creator_folder_migrations(
+    output_dir: Path,
+    explicit_mappings: Iterable[str] = (),
+) -> tuple[list[tuple[Path, Path]], list[str]]:
+    """Find verified numeric-to-username folder renames without changing files."""
+    root = output_dir / "Instagram"
+    if root.is_symlink():
+        raise ValueError(f"Refusing to migrate through symlink: {root}")
+    if not root.is_dir():
+        return [], [f"No Instagram folder found: {root}"]
+
+    explicit: dict[str, str] = {}
+    for mapping in explicit_mappings:
+        if "=" not in mapping:
+            raise ValueError(f"Invalid --map value {mapping!r}; expected OLD_ID=USERNAME")
+        old_id, username = mapping.split("=", 1)
+        username = safe_creator_folder_name(username)
+        if not old_id.isdigit() or not username:
+            raise ValueError(f"Invalid --map value {mapping!r}; expected numeric ID and username")
+        if old_id in explicit and explicit[old_id] != username:
+            raise ValueError(f"Multiple usernames supplied for folder {old_id}")
+        explicit[old_id] = username
+
+    existing_dirs = [
+        path for path in root.iterdir()
+        if path.is_dir() and not path.is_symlink()
+    ]
+    existing_casefold = {path.name.casefold() for path in root.iterdir()}
+    plans: list[tuple[Path, Path]] = []
+    messages: list[str] = []
+    planned_casefold: set[str] = set()
+
+    for folder in sorted(existing_dirs, key=lambda path: path.name):
+        if not folder.name.isdigit():
+            continue
+        media_ids = set()
+        for path in folder.iterdir():
+            if not path.is_file() or path.is_symlink():
+                continue
+            media_ids.add(
+                path.name.removesuffix(".info.json")
+                if path.name.endswith(".info.json")
+                else path.stem
+            )
+        candidates = _metadata_creator_candidates(folder, folder.name)
+        candidates.update(_manifest_creator_candidates(output_dir / "manifests", media_ids))
+        if folder.name in explicit:
+            candidates = {explicit[folder.name]}
+
+        if len(candidates) != 1:
+            reason = "no verified username" if not candidates else "ambiguous usernames: " + ", ".join(sorted(candidates))
+            messages.append(f"SKIP {folder.name}: {reason}")
+            continue
+
+        username = next(iter(candidates))
+        target = root / username
+        target_casefold = username.casefold()
+        if target_casefold in existing_casefold and target_casefold != folder.name.casefold():
+            messages.append(f"SKIP {folder.name}: destination already exists ({target.name})")
+            continue
+        if target_casefold in planned_casefold:
+            messages.append(f"SKIP {folder.name}: destination conflicts with another planned rename ({target.name})")
+            continue
+        if target_casefold == folder.name.casefold():
+            messages.append(f"SKIP {folder.name}: username is unchanged")
+            continue
+        planned_casefold.add(target_casefold)
+        plans.append((folder, target))
+
+    return plans, messages
+
+
+def migrate_creator_folders(output_dir: Path, apply: bool, explicit_mappings: Iterable[str]) -> None:
+    plans, messages = find_creator_folder_migrations(output_dir, explicit_mappings)
+    for message in messages:
+        print(message)
+    for source, target in plans:
+        action = "RENAME" if apply else "WOULD RENAME"
+        print(f"{action} {source.name} -> {target.name}")
+
+    if not plans:
+        print("No verified creator folders can be migrated.")
+        return
+    if not apply:
+        print("Dry run only. Re-run with --apply to rename these folders.")
+        return
+
+    for source, target in plans:
+        source.rename(target)
+    print(f"Renamed {len(plans)} creator folder(s).")
+
+
 def extract_post_urls_from_hrefs(hrefs: Iterable[str]) -> list[str]:
-    seen: set[str] = set()
+    seen_shortcodes: set[str] = set()
     urls: list[str] = []
 
     for href in hrefs:
         if not href:
             continue
         parsed = urlparse(href)
-        path = parsed.path if parsed.scheme else urlparse("https://www.instagram.com" + href).path
+        if parsed.scheme or parsed.netloc:
+            if parsed.netloc.lower().removeprefix("www.") != "instagram.com":
+                continue
+            path = parsed.path
+        else:
+            path = urlparse("https://www.instagram.com" + href).path
         match = POST_PATH_RE.match(path)
         if not match:
             continue
         kind, shortcode = match.group(1).lower(), match.group(2)
         if kind == "reels":
             kind = "reel"
+        if shortcode in seen_shortcodes:
+            continue
         canonical = f"https://www.instagram.com/{kind}/{shortcode}/"
-        if canonical not in seen:
-            seen.add(canonical)
-            urls.append(canonical)
+        seen_shortcodes.add(shortcode)
+        urls.append(canonical)
     return urls
 
 
@@ -290,7 +446,7 @@ def wait_for_profile_media_links(page, timeout_ms: int = 20_000) -> bool:
         page.wait_for_function(
             """
             () => Array.from(document.querySelectorAll("a[href]")).some(
-                link => /^\\/(?:[^/?#]+\\/)?(?:p|reels?|tv)\\/[^/?#]+\\/?$/i.test(
+                link => /^\\/(?:[^/?#]+\\/)?(?:p|reels?(?!\\/audio\\/)|tv)\\/[^/?#]+\\/?$/i.test(
                     new URL(link.href).pathname
                 )
             )
@@ -365,6 +521,74 @@ def login(storage_state: Path, cookie_file: Path, channel: str | None = None) ->
     print(f"Saved yt-dlp cookie file: {cookie_file}")
 
 
+def _collect_profile_surface(
+    page,
+    surface_url: str,
+    surface_name: str,
+    found: dict[str, None],
+    found_shortcodes: set[str],
+    max_scrolls: int,
+    scroll_pause: float,
+    max_posts: int | None,
+) -> bool:
+    """Collect one profile tab into the shared media URL set."""
+    page.goto(surface_url, wait_until="domcontentloaded", timeout=60000)
+
+    maybe_click_button_by_text(
+        page,
+        [
+            "allow all cookies",
+            "accept all",
+            "decline optional cookies",
+            "not now",
+            "close",
+        ],
+    )
+
+    loaded_media = wait_for_profile_media_links(page)
+    if not loaded_media:
+        eprint(
+            f"No post/reel links appeared in the {surface_name} tab during the initial "
+            f"20-second wait (page URL: {page.url}; anchors: {page.locator('a[href]').count()})."
+        )
+
+    last_count = len(found)
+    idle_rounds = 0
+    for scroll_num in range(max_scrolls + 1):
+        hrefs = collect_new_profile_media_hrefs(page)
+        for url in extract_post_urls_from_hrefs(hrefs):
+            shortcode = urlparse(url).path.rstrip("/").split("/")[-1]
+            if shortcode in found_shortcodes:
+                continue
+            found_shortcodes.add(shortcode)
+            found.setdefault(url, None)
+            if max_posts and len(found) >= max_posts:
+                break
+
+        print(f"Collected {len(found)} post/reel URLs after {surface_name} scroll {scroll_num}/{max_scrolls}")
+
+        if max_posts and len(found) >= max_posts:
+            break
+
+        if len(found) == last_count:
+            idle_rounds += 1
+        else:
+            idle_rounds = 0
+            last_count = len(found)
+
+        if idle_rounds >= 4 and scroll_num >= 4:
+            print(f"No new URLs found in the {surface_name} tab after several scrolls; stopping collection.")
+            break
+
+        if scroll_num >= max_scrolls:
+            break
+
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        wait_for_new_profile_media_link(page, max(0.0, scroll_pause) * 1000)
+
+    return loaded_media
+
+
 def collect_profile_post_urls(
     profile_url: str,
     storage_state: Path | None,
@@ -379,8 +603,11 @@ def collect_profile_post_urls(
         raise ValueError("Expected a profile URL like https://www.instagram.com/username/")
 
     found: dict[str, None] = {}
-    last_count = 0
-    idle_rounds = 0
+    found_shortcodes: set[str] = set()
+    surfaces = (
+        (profile_url, "profile"),
+        (f"{profile_url.rstrip('/')}/reels/", "Reels"),
+    )
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, channel=channel)
@@ -388,53 +615,27 @@ def collect_profile_post_urls(
         if storage_state and storage_state.exists():
             context_kwargs["storage_state"] = str(storage_state)
         context = browser.new_context(**context_kwargs)
-        page = context.new_page()
-        page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
-
-        maybe_click_button_by_text(
-            page,
-            [
-                "allow all cookies",
-                "accept all",
-                "decline optional cookies",
-                "not now",
-                "close",
-            ],
-        )
-
-        if not wait_for_profile_media_links(page):
-            eprint(
-                "No post/reel links appeared during the initial 20-second wait "
-                f"(page URL: {page.url}; anchors: {page.locator('a[href]').count()})."
-            )
-
-        for scroll_num in range(max_scrolls + 1):
-            hrefs = collect_new_profile_media_hrefs(page)
-            for url in extract_post_urls_from_hrefs(hrefs):
-                found.setdefault(url, None)
-                if max_posts and len(found) >= max_posts:
-                    break
-
-            print(f"Collected {len(found)} post/reel URLs after scroll {scroll_num}/{max_scrolls}")
-
+        for surface_url, surface_name in surfaces:
             if max_posts and len(found) >= max_posts:
                 break
-
-            if len(found) == last_count:
-                idle_rounds += 1
-            else:
-                idle_rounds = 0
-                last_count = len(found)
-
-            if idle_rounds >= 4 and scroll_num >= 4:
-                print("No new URLs found after several scrolls; stopping collection.")
-                break
-
-            if scroll_num >= max_scrolls:
-                break
-
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            wait_for_new_profile_media_link(page, max(0.0, scroll_pause) * 1000)
+            page = context.new_page()
+            try:
+                _collect_profile_surface(
+                    page=page,
+                    surface_url=surface_url,
+                    surface_name=surface_name,
+                    found=found,
+                    found_shortcodes=found_shortcodes,
+                    max_scrolls=max_scrolls,
+                    scroll_pause=scroll_pause,
+                    max_posts=max_posts,
+                )
+            except Exception as exc:
+                if surface_name != "Reels":
+                    raise
+                eprint(f"Could not collect the Reels tab ({exc}); keeping collected profile URLs.")
+            finally:
+                page.close()
 
         if storage_state:
             storage_state.parent.mkdir(parents=True, exist_ok=True)
@@ -456,7 +657,8 @@ def build_ydl_options(
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     opts = {
-        "outtmpl": str(output_dir / "%(extractor)s" / "%(uploader_id|unknown)s" / "%(id)s.%(ext)s"),
+        # Instagram's channel field is the username; uploader_id is numeric.
+        "outtmpl": str(output_dir / "%(extractor)s" / "%(channel,uploader_id|unknown)s" / "%(id)s.%(ext)s"),
         "download_archive": str(archive_path),
         "ignoreerrors": True,
         "continuedl": True,
@@ -563,7 +765,15 @@ def download_extracted_media(
             else:
                 if info:
                     for entry in iter_media_entries(info):
-                        for key in ("extractor", "extractor_key", "webpage_url", "original_url"):
+                        for key in (
+                            "extractor",
+                            "extractor_key",
+                            "webpage_url",
+                            "original_url",
+                            "channel",
+                            "uploader",
+                            "uploader_id",
+                        ):
                             if info.get(key) and not entry.get(key):
                                 entry[key] = info[key]
 
@@ -687,6 +897,16 @@ def command_download(args: argparse.Namespace) -> None:
         print(f"Done. Downloads are under: {plan.output_dir}")
 
 
+def command_migrate_folders(args: argparse.Namespace) -> None:
+    output_dir = Path(args.output).expanduser().resolve()
+    with workspace_run_lock(Path(".ig_media_downloader.lock").resolve()):
+        migrate_creator_folders(
+            output_dir=output_dir,
+            apply=args.apply,
+            explicit_mappings=args.map,
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ig-scraper",
@@ -740,6 +960,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reuse URLs from an earlier manifest instead of collecting the profile again.",
     )
     dl.set_defaults(func=command_download)
+
+    migrate = subparsers.add_parser(
+        "migrate-folders",
+        help="Safely rename verified numeric creator folders to usernames.",
+    )
+    migrate.add_argument("--output", default="downloads", help="Output folder containing Instagram/. Default: downloads")
+    migrate.add_argument(
+        "--map",
+        action="append",
+        default=[],
+        metavar="OLD_ID=USERNAME",
+        help="Explicitly map a numeric folder when manifests cannot verify it; repeat as needed.",
+    )
+    migrate.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the displayed renames. Without this flag, only show a dry-run preview.",
+    )
+    migrate.set_defaults(func=command_migrate_folders)
 
     return parser
 

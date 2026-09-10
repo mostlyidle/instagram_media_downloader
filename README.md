@@ -6,8 +6,8 @@ This tool is intentionally limited to media that is publicly accessible or acces
 
 ## What it downloads
 
-- Feed posts discovered from profile scrolling
-- Reels discovered from profile scrolling
+- Feed posts discovered from the profile grid
+- Reels discovered from both the profile grid and the profile's Reels tab
 - Carousel post media when yt-dlp can extract it
 - Optional metadata JSON and thumbnails
 
@@ -65,8 +65,11 @@ ig-scraper --user USERNAME --max-posts 10 --show-browser --write-metadata
 The downloaded media will be placed under:
 
 ```text
-downloads/<extractor>/<uploader_id>/<media_id>.<ext>
+downloads/<extractor>/<username>/<media_id>.<ext>
 ```
+
+The username is preferred; the numeric uploader ID is used only when yt-dlp
+does not provide a username.
 
 A manifest of collected URLs is written under:
 
@@ -109,6 +112,29 @@ exits instead of sharing the Instagram session and generating additional traffic
 
 # Skip Playwright and give the profile URL directly to yt-dlp
 --direct-only
+```
+
+### Rename existing numeric creator folders
+
+Existing numeric folders are not renamed automatically. First preview verified
+renames using metadata and saved manifests:
+
+```bash
+ig-scraper migrate-folders
+```
+
+Apply the preview only after checking it:
+
+```bash
+ig-scraper migrate-folders --apply
+```
+
+Folders with no unique verification, destination collisions, or symlinks are
+left unchanged. For a folder that cannot be verified from local data, provide
+an explicit mapping:
+
+```bash
+ig-scraper migrate-folders --map NUMERIC_ID=USERNAME --apply
 ```
 
 ## Troubleshooting
